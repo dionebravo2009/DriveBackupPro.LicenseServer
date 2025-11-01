@@ -12,12 +12,6 @@ string PemEncode(string label, byte[] data)
     return $"-----BEGIN {label}-----\n{b64}\n-----END {label}-----";
 }
 
-using System.Security.Cryptography;
-using System.Text;
-using System.Text.Json;
-
-// ... seu código anterior permanece (chaves, /healthz, /api/public-key, etc.)
-
 string Sha256(string s)
 {
     using var sha = SHA256.Create();

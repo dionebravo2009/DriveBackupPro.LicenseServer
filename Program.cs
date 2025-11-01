@@ -1,61 +1,115 @@
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
+
 var builder = WebApplication.CreateBuilder(args);
 var app = builder.Build();
 
-var keyDir = Path.Combine(AppContext.BaseDirectory, "keys");
-Directory.CreateDirectory(keyDir);
-var privPath = Path.Combine(keyDir, "private.pem");
-var pubPath = Path.Combine(keyDir, "public.pem");
+// ===== Carrega/gera chaves =====
+RSA privateRsa;
+string publicPem;
 
-if (!File.Exists(privPath) || !File.Exists(pubPath))
+string PemEncode(string label, byte[] data)
 {
-    using var rsa = RSA.Create(2048);
-    var priv = rsa.ExportPkcs8PrivateKey();
-    var pub = rsa.ExportSubjectPublicKeyInfo();
-    File.WriteAllText(privPath, PemEncode("PRIVATE KEY", priv));
-    File.WriteAllText(pubPath, PemEncode("PUBLIC KEY", pub));
+    var b64 = Convert.ToBase64String(data, Base64FormattingOptions.InsertLineBreaks);
+    return $"-----BEGIN {label}-----\n{b64}\n-----END {label}-----";
 }
 
+// 1) Tenta PRIVATE_PEM do ambiente (Render: Settings → Environment → PRIVATE_PEM)
+var envPriv = Environment.GetEnvironmentVariable("PRIVATE_PEM");
+if (!string.IsNullOrWhiteSpace(envPriv))
+{
+    privateRsa = RSA.Create();
+    privateRsa.ImportFromPem(envPriv);
+    using var pubTmp = RSA.Create();
+    pubTmp.ImportRSAPublicKey(privateRsa.ExportRSAPublicKey(), out _);
+    publicPem = PemEncode("PUBLIC KEY", pubTmp.ExportSubjectPublicKeyInfo());
+}
+else
+{
+    // 2) Fallback: usa arquivos locais (cuidado no Render Free, pode se perder entre restarts)
+    var keyDir = Path.Combine(AppContext.BaseDirectory, "keys");
+    Directory.CreateDirectory(keyDir);
+    var privPath = Path.Combine(keyDir, "private.pem");
+    var pubPath  = Path.Combine(keyDir, "public.pem");
+
+    if (!File.Exists(privPath) || !File.Exists(pubPath))
+    {
+        using var gen = RSA.Create(2048);
+        File.WriteAllText(privPath, PemEncode("PRIVATE KEY", gen.ExportPkcs8PrivateKey()));
+        File.WriteAllText(pubPath,  PemEncode("PUBLIC KEY",  gen.ExportSubjectPublicKeyInfo()));
+    }
+
+    privateRsa = RSA.Create();
+    privateRsa.ImportFromPem(File.ReadAllText(privPath));
+    publicPem = File.ReadAllText(pubPath);
+}
+
+// ===== Endpoints =====
+app.MapGet("/", () => Results.Json(new {
+    ok = true,
+    service = "DriveBackupPro.LicenseServer",
+    endpoints = new[] { "/healthz", "/api/public-key", "POST /api/license" }
+}));
+
 app.MapGet("/healthz", () => Results.Ok("ok"));
-app.MapGet("/api/public-key", () => Results.Text(File.ReadAllText(pubPath), "text/plain"));
+
+app.MapGet("/api/public-key", () => Results.Text(publicPem, "text/plain"));
+
+// DTO que o cliente TokenMaker (online) deve enviar
+public record LicenseRequest(string machineId, int months);
+
+// DTO do payload que o cliente WPF espera validar offline
+public record LicensePayload(string MachineId, string IssuedUtc, string ExpiresUtc, string Type);
 
 app.MapPost("/api/license", async (HttpContext ctx) =>
 {
-    // Lê do ambiente (Render → Settings → Environment → Admin-API-Key)
+    // 1) Admin-API-Key (Render → Environment)
     var admin = Environment.GetEnvironmentVariable("Admin-API-Key") ?? "CHANGEME";
-
     if (!ctx.Request.Headers.TryGetValue("Admin-API-Key", out var hk) ||
         !string.Equals(hk.ToString().Trim(), admin.Trim(), StringComparison.Ordinal))
     {
         return Results.Unauthorized();
     }
 
-    using var reader = new StreamReader(ctx.Request.Body, Encoding.UTF8);
-    var body = await reader.ReadToEndAsync(); // JSON com machineId/months
+    // 2) Lê o body: { "machineId": "...", "months": 1 }
+    LicenseRequest req;
+    try
+    {
+        req = await ctx.Request.ReadFromJsonAsync<LicenseRequest>()
+              ?? throw new Exception("JSON inválido");
+        if (string.IsNullOrWhiteSpace(req.machineId) || req.months <= 0)
+            throw new Exception("machineId ou months inválidos");
+    }
+    catch (Exception ex)
+    {
+        return Results.BadRequest(new { error = "Bad JSON: " + ex.Message });
+    }
 
-    // ... assina com a PRIVATE e retorna { token }
-    var bytes = Encoding.UTF8.GetBytes(body);
-    using var privateRsa = RSA.Create();
+    // 3) Monta o payload que o cliente espera
+    var issued  = DateTime.UtcNow;
+    var expires = issued.AddMonths(req.months);
+    var payload = new LicensePayload(
+        MachineId: req.machineId,
+        IssuedUtc: issued.ToString("o"),
+        ExpiresUtc: expires.ToString("o"),
+        Type: "monthly"
+    );
 
-    // Se você usa PRIVATE_PEM como secret no Render, importe aqui:
-    var envPriv = Environment.GetEnvironmentVariable("PRIVATE_PEM");
-    if (!string.IsNullOrWhiteSpace(envPriv))
-        privateRsa.ImportFromPem(envPriv);
-    else
-        privateRsa.ImportFromPem(File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "keys", "private.pem")));
+    // Serializa mantendo as chaves com a capitalização exata (sem camelCase)
+    var json = JsonSerializer.SerializeToUtf8Bytes(payload, new JsonSerializerOptions
+    {
+        PropertyNamingPolicy = null,
+        WriteIndented = false
+    });
 
-    var sig = privateRsa.SignData(bytes, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
-    var token = Convert.ToBase64String(bytes) + "." + Convert.ToBase64String(sig);
+    // 4) Assina com RSA-SHA256 (PKCS#1 v1.5)
+    var sig = privateRsa.SignData(json, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+
+    // 5) Token = base64(payloadJson) + "." + base64(signature)
+    var token = Convert.ToBase64String(json) + "." + Convert.ToBase64String(sig);
 
     return Results.Json(new { token });
 });
 
-
 app.Run();
-
-static string PemEncode(string label, byte[] data)
-{
-    var b64 = Convert.ToBase64String(data, Base64FormattingOptions.InsertLineBreaks);
-    return $"-----BEGIN {label}-----\n{b64}\n-----END {label}-----";
-}

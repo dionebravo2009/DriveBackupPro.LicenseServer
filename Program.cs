@@ -12,39 +12,6 @@ string PemEncode(string label, byte[] data)
     return $"-----BEGIN {label}-----\n{b64}\n-----END {label}-----";
 }
 
-// ===== carrega/gera chaves =====
-RSA privateRsa;
-string publicPem;
-
-var envPriv = Environment.GetEnvironmentVariable("PRIVATE_PEM");
-if (!string.IsNullOrWhiteSpace(envPriv))
-{
-    privateRsa = RSA.Create();
-    privateRsa.ImportFromPem(envPriv);
-
-    using var pubTmp = RSA.Create();
-    pubTmp.ImportRSAPublicKey(privateRsa.ExportRSAPublicKey(), out _);
-    publicPem = PemEncode("PUBLIC KEY", pubTmp.ExportSubjectPublicKeyInfo());
-}
-else
-{
-    var keyDir = Path.Combine(AppContext.BaseDirectory, "keys");
-    Directory.CreateDirectory(keyDir);
-    var privPath = Path.Combine(keyDir, "private.pem");
-    var pubPath  = Path.Combine(keyDir, "public.pem");
-
-    if (!File.Exists(privPath) || !File.Exists(pubPath))
-    {
-        using var gen = RSA.Create(2048);
-        File.WriteAllText(privPath, PemEncode("PRIVATE KEY", gen.ExportPkcs8PrivateKey()));
-        File.WriteAllText(pubPath,  PemEncode("PUBLIC KEY",  gen.ExportSubjectPublicKeyInfo()));
-    }
-
-    privateRsa = RSA.Create();
-    privateRsa.ImportFromPem(File.ReadAllText(privPath));
-    publicPem = File.ReadAllText(pubPath);
-}
-
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -169,7 +136,3 @@ app.MapPost("/api/license", async (HttpContext ctx) =>
 public record LicenseRequest(string machineId, int months);
 public record LicensePayload(string MachineId, string IssuedUtc, string ExpiresUtc, string Type);
 
-
-// ===== Tipos (apenas no final; NENHUM statement depois disso) =====
-public record LicenseRequest(string machineId, int months);
-public record LicensePayload(string MachineId, string IssuedUtc, string ExpiresUtc, string Type);
